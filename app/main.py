@@ -1,6 +1,10 @@
 # main.py
-# Cloud Run Job: lê XLSX do GCS (lamina_*), padroniza colunas, gera Parquet em staging e carrega no BigQuery
-# Logging no padrão do seu código: google.cloud.logging + logger nomeado + severities, com logs bem mais ricos.
+# Correções aplicadas:
+# 1) Colunas do Excel sempre STRING (drift-proof) — metadados ficam tipados.
+# 2) competencia garantida como DATE (não TIMESTAMP) tanto no pandas quanto no Parquet (cast explícito via pyarrow).
+# 3) data_ingestao garantida como TIMESTAMP UTC no Parquet.
+# 4) schema_update_options habilitado somente quando permitido (WRITE_APPEND ou WRITE_TRUNCATE em partição).
+# 5) Logs adicionais para inspecionar dtypes e schema Arrow (diagnóstico rápido).
 
 import os
 import re
@@ -27,12 +31,10 @@ from google.api_core.exceptions import NotFound, BadRequest
 # Configurações (ENV first)
 # --------------------------
 GCS_BUCKET = os.getenv("GCS_BUCKET", "laminas_fechamento_invest")
-GCS_PATH_PREFIX = os.getenv("GCS_PATH_PREFIX", "").lstrip("/")  # ex: "raw/"
+GCS_PATH_PREFIX = os.getenv("GCS_PATH_PREFIX", "").strip().lstrip("/")  # ex: "raw/"
 
 FILE_PREFIX = os.getenv("FILE_PREFIX", "lamina_")
-FILE_SUFFIX = os.getenv(
-    "FILE_SUFFIX", ""
-)  # pode setar "" para aceitar qualquer lamina_*.xlsx
+FILE_SUFFIX = os.getenv("FILE_SUFFIX", "")  # em prod recomendo "_fechamento.xlsx"
 
 SHEET = os.getenv("SHEET", "0")  # índice "0" ou nome da aba
 HEADER_ROW = int(os.getenv("HEADER_ROW", "0"))  # linha do header (0=primeira)
@@ -51,15 +53,13 @@ BQ_PROJECT = (
 BQ_DATASET = os.getenv("BQ_DATASET", "INVEST_REFINED_ZONE")
 BQ_TABLE = os.getenv("BQ_TABLE", "laminas_fechamento_invest")
 
-LOAD_MODE = (
-    os.getenv("LOAD_MODE", "overwrite_partition").strip().lower()
-)  # overwrite_partition|append|overwrite_table
+LOAD_MODE = os.getenv("LOAD_MODE", "overwrite_partition").strip().lower()
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 MAX_FILES = int(os.getenv("MAX_FILES", "0") or "0")
 FAIL_ON_FILE_ERROR = os.getenv("FAIL_ON_FILE_ERROR", "false").lower() == "true"
 
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3") or "3")
-RETRY_DELAY = float(os.getenv("RETRY_DELAY", "2") or "2")  # segundos (base)
+RETRY_DELAY = float(os.getenv("RETRY_DELAY", "2") or "2")
 STDOUT_MIRROR = os.getenv("STDOUT_MIRROR", "true").lower() == "true"
 
 LOGGER_NAME = os.getenv("LOGGER_NAME", "laminas_fechamento")
@@ -97,10 +97,6 @@ def _mirror_stdout(payload: Dict):
 
 
 def log_event(message: str, severity: str = "INFO", **fields):
-    """
-    Log estruturado (ótimo para Router/sinks) + log_text (padrão humano)
-    + espelho opcional em stdout (ajuda a ver logs no Cloud Run UI mesmo com sink errado)
-    """
     payload = {
         "tag": LOG_TAG,
         "run_id": RUN_ID,
@@ -113,18 +109,14 @@ def log_event(message: str, severity: str = "INFO", **fields):
         **fields,
     }
 
-    # 1) Estruturado (melhor para filtros do Router)
     try:
         logger.log_struct(payload, severity=severity)
     except Exception:
         pass
 
-    # 2) Texto (padrão do seu código)
     try:
-        # mensagem curta + campos principais
         extra = ""
         if fields:
-            # evita logs gigantes
             keys = [
                 "file",
                 "gcs_uri",
@@ -134,6 +126,7 @@ def log_event(message: str, severity: str = "INFO", **fields):
                 "cols",
                 "elapsed_ms",
                 "error",
+                "hint",
             ]
             compact = {k: fields.get(k) for k in keys if k in fields}
             if compact:
@@ -142,7 +135,6 @@ def log_event(message: str, severity: str = "INFO", **fields):
     except Exception:
         pass
 
-    # 3) stdout (para depuração rápida)
     _mirror_stdout(payload)
 
 
@@ -174,7 +166,7 @@ class StepTimer:
 
 
 # --------------------------
-# Retry (padrão semelhante ao seu)
+# Retry
 # --------------------------
 def retry_on_failure(func):
     def wrapper(*args, **kwargs):
@@ -193,7 +185,7 @@ def retry_on_failure(func):
                     retry_in_s=delay,
                 )
                 time.sleep(delay)
-                delay = min(delay * 2, 30)  # backoff simples
+                delay = min(delay * 2, 30)
         return None
 
     return wrapper
@@ -281,13 +273,7 @@ def drop_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_year_month_from_filename(filename: str) -> Tuple[int, int]:
-    """
-    Espera: lamina_2024_abril_fechamento.xlsx
-    Aceita delimitadores: _, -, .
-    """
     name = strip_accents(filename.lower())
-
-    # troca delimitadores por espaço para o \b funcionar corretamente
     search = re.sub(r"[_\-.]+", " ", name)
 
     m_year = re.search(r"(19\d{2}|20\d{2})", search)
@@ -295,12 +281,10 @@ def parse_year_month_from_filename(filename: str) -> Tuple[int, int]:
         raise ValueError(f"Não achei ano no filename: {filename}")
     year = int(m_year.group(1))
 
-    # mês por nome (janeiro...dezembro)
     for k, v in PT_MONTHS.items():
         if re.search(rf"\b{k}\b", search):
             return year, v
 
-    # mês numérico (01..12) como token
     m_num = re.search(r"(?:^|\s)(0?[1-9]|1[0-2])(?:\s|$)", search)
     if m_num:
         return year, int(m_num.group(1))
@@ -317,8 +301,61 @@ def read_xlsx_to_df(xlsx_bytes: bytes) -> pd.DataFrame:
     )
 
 
-def dataframe_to_parquet_bytes(df: pd.DataFrame) -> bytes:
+def cast_arrow_types(table: pa.Table) -> pa.Table:
+    """
+    Blindagem de tipos no Parquet:
+    - competencia: DATE (date32)
+    - data_ingestao: TIMESTAMP UTC
+    - ano/mes: int64
+    """
+    names = table.schema.names
+
+    def _set(name: str, array: pa.Array):
+        i = table.schema.get_field_index(name)
+        return table.set_column(i, name, array)
+
+    if "competencia" in names:
+        i = table.schema.get_field_index("competencia")
+        table = table.set_column(i, "competencia", table.column(i).cast(pa.date32()))
+
+    if "data_ingestao" in names:
+        i = table.schema.get_field_index("data_ingestao")
+        # mantém UTC no parquet (BigQuery vira TIMESTAMP)
+        table = table.set_column(
+            i, "data_ingestao", table.column(i).cast(pa.timestamp("us", tz="UTC"))
+        )
+
+    if "ano" in names:
+        i = table.schema.get_field_index("ano")
+        table = table.set_column(i, "ano", table.column(i).cast(pa.int64()))
+
+    if "mes" in names:
+        i = table.schema.get_field_index("mes")
+        table = table.set_column(i, "mes", table.column(i).cast(pa.int64()))
+
+    return table
+
+
+def dataframe_to_parquet_bytes(df: pd.DataFrame, filename: str) -> bytes:
+    # Schema pré-cast (útil p/ diagnóstico)
     table = pa.Table.from_pandas(df, preserve_index=False)
+
+    log_event(
+        "Arrow schema (pre-cast)",
+        "INFO",
+        file=filename,
+        arrow_schema=str(table.schema),
+    )
+
+    table = cast_arrow_types(table)
+
+    log_event(
+        "Arrow schema (post-cast)",
+        "INFO",
+        file=filename,
+        arrow_schema=str(table.schema),
+    )
+
     out = BytesIO()
     pq.write_table(table, out, compression="snappy")
     return out.getvalue()
@@ -333,8 +370,7 @@ def ensure_partitioned_table():
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
     try:
-        tbl = bq.get_table(table_id)
-        return tbl
+        return bq.get_table(table_id)
     except NotFound:
         schema = [
             bigquery.SchemaField("ano", "INT64"),
@@ -359,14 +395,36 @@ def ensure_partitioned_table():
 @retry_on_failure
 def load_parquet_to_bq(source_uri: str, destination: str, write_disposition: str):
     bq = get_bigquery_client()
+
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.PARQUET,
         write_disposition=write_disposition,
-        # schema_update_options=[
-        #    bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
-        #    bigquery.SchemaUpdateOption.ALLOW_FIELD_RELAXATION,
-        # ],
     )
+
+    # schema_update_options: permitido apenas em WRITE_APPEND
+    # ou em WRITE_TRUNCATE quando o destino é partição (tabela$YYYYMMDD)
+    is_partition_target = "$" in destination
+    if write_disposition == bigquery.WriteDisposition.WRITE_APPEND or (
+        write_disposition == bigquery.WriteDisposition.WRITE_TRUNCATE
+        and is_partition_target
+    ):
+        job_config.schema_update_options = [
+            bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
+            bigquery.SchemaUpdateOption.ALLOW_FIELD_RELAXATION,
+        ]
+        schema_update_enabled = True
+    else:
+        schema_update_enabled = False
+
+    log_event(
+        "Disparando load BigQuery",
+        "INFO",
+        source_uri=source_uri,
+        destination=destination,
+        write_disposition=str(write_disposition),
+        schema_update_enabled=schema_update_enabled,
+    )
+
     job = bq.load_table_from_uri(source_uri, destination, job_config=job_config)
     job.result()
     return True
@@ -478,11 +536,9 @@ def main():
             max_files=MAX_FILES,
         )
 
-    # Location compat
     with StepTimer("check_location"):
         check_location_compat()
 
-    # Ensure table
     if LOAD_MODE == "overwrite_partition":
         with StepTimer(
             "ensure_partitioned_table",
@@ -490,7 +546,6 @@ def main():
         ):
             ensure_partitioned_table()
 
-    # List files
     with StepTimer("list_files"):
         blobs = list_target_blobs()
         log_event("Arquivos selecionados", "INFO", total_files=len(blobs))
@@ -501,7 +556,6 @@ def main():
 
     st = get_storage_client()
     bucket = st.bucket(GCS_BUCKET)
-
     base_table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
     processed = 0
@@ -517,7 +571,6 @@ def main():
             "process_file", file=filename, gcs_uri=gcs_uri, index=idx, total=len(blobs)
         ):
             try:
-                # parse competencia
                 year, month = parse_year_month_from_filename(filename)
                 competencia_dt = date(year, month, 1)
                 partition_id = competencia_dt.strftime("%Y%m%d")
@@ -531,14 +584,12 @@ def main():
                     competencia=str(competencia_dt),
                 )
 
-                # download
                 with StepTimer("download_xlsx", file=filename):
                     xlsx_bytes = download_blob_bytes(blob)
                     log_event(
                         "Download OK", "INFO", file=filename, bytes=len(xlsx_bytes)
                     )
 
-                # read excel
                 with StepTimer(
                     "read_excel", file=filename, sheet=SHEET, header_row=HEADER_ROW
                 ):
@@ -549,7 +600,6 @@ def main():
                     log_event("Arquivo sem dados (empty)", "WARNING", file=filename)
                     continue
 
-                # cleanup empty cols
                 if DROP_EMPTY_COLUMNS:
                     before_cols = len(df.columns)
                     df = drop_empty_columns(df)
@@ -563,7 +613,6 @@ def main():
                             after_cols=after_cols,
                         )
 
-                # normalize columns
                 original_cols = [str(c) for c in df.columns.tolist()]
                 df.columns = normalize_columns(original_cols)
 
@@ -576,21 +625,36 @@ def main():
                     cols_sample=df.columns.tolist()[:15],
                 )
 
-                # force string
+                # ---- DRIFT-PROOF: apenas colunas do Excel viram STRING ----
+                excel_cols = df.columns.tolist()
                 if FORCE_STRING:
-                    with StepTimer("force_string", file=filename):
-                        for c in df.columns:
+                    with StepTimer("force_string_excel_only", file=filename):
+                        for c in excel_cols:
                             df[c] = df[c].map(
                                 lambda x: None if pd.isna(x) else str(x).strip()
                             )
 
-                # metadata
+                # ---- METADADOS TIPADOS (blindagem) ----
                 df["ano"] = int(year)
                 df["mes"] = int(month)
-                df["competencia"] = pd.to_datetime(competencia_dt)
+
+                # competencia como DATE real (python date) replicado por linha
+                df["competencia"] = [competencia_dt] * len(df)
+
                 df["arquivo_origem"] = filename
                 df["gcs_uri"] = gcs_uri
-                df["data_ingestao"] = pd.Timestamp(datetime.now(timezone.utc))
+
+                # data_ingestao como datetime UTC (vira TIMESTAMP no BQ)
+                df["data_ingestao"] = [datetime.now(timezone.utc)] * len(df)
+
+                # Logs de tipos (diagnóstico)
+                log_event(
+                    "Tipos dos metadados",
+                    "INFO",
+                    file=filename,
+                    competencia_python_type=str(type(df["competencia"].iloc[0])),
+                    data_ingestao_python_type=str(type(df["data_ingestao"].iloc[0])),
+                )
 
                 if DRY_RUN:
                     processed += 1
@@ -603,9 +667,8 @@ def main():
                     )
                     continue
 
-                # parquet
                 with StepTimer("to_parquet", file=filename):
-                    parquet_bytes = dataframe_to_parquet_bytes(df)
+                    parquet_bytes = dataframe_to_parquet_bytes(df, filename)
                     log_event(
                         "Parquet gerado",
                         "INFO",
@@ -613,7 +676,6 @@ def main():
                         parquet_bytes=len(parquet_bytes),
                     )
 
-                # staging upload
                 safe_base = re.sub(r"[^a-zA-Z0-9_.-]+", "_", filename).replace(
                     ".xlsx", ".parquet"
                 )
@@ -628,7 +690,6 @@ def main():
                         "Staging OK", "INFO", file=filename, staging_uri=staging_uri
                     )
 
-                # load BQ
                 if LOAD_MODE == "overwrite_partition":
                     destination = f"{base_table_id}${partition_id}"
                     write_disp = bigquery.WriteDisposition.WRITE_TRUNCATE
@@ -650,6 +711,7 @@ def main():
                         "INFO",
                         file=filename,
                         destination=destination,
+                        rows=len(df),
                     )
 
                 if CLEANUP_STAGING:
@@ -675,6 +737,7 @@ def main():
                     file=filename,
                     gcs_uri=gcs_uri,
                     error=str(e),
+                    hint="Verifique tipagem de competencia (DATE) e schema do Arrow nos logs.",
                     traceback=traceback.format_exc(),
                 )
                 if FAIL_ON_FILE_ERROR:
@@ -687,6 +750,7 @@ def main():
                     file=filename,
                     gcs_uri=gcs_uri,
                     error=str(e),
+                    hint="Erro inesperado — veja traceback completo no log_struct/stdout.",
                     traceback=traceback.format_exc(),
                 )
                 if FAIL_ON_FILE_ERROR:
