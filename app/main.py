@@ -52,7 +52,7 @@ BQ_DATASET = os.getenv("BQ_DATASET", "INVEST_REFINED_ZONE")
 BQ_TABLE = os.getenv("BQ_TABLE", "laminas_fechamento_invest")
 
 LOAD_MODE = (
-    os.getenv("LOAD_MODE", "overwrite_table").strip().lower()
+    os.getenv("LOAD_MODE", "overwrite_partition").strip().lower()
 )  # overwrite_partition|append|overwrite_table
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 MAX_FILES = int(os.getenv("MAX_FILES", "0") or "0")
