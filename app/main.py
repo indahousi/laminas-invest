@@ -48,7 +48,7 @@ BQ_PROJECT = (
     os.getenv("BQ_PROJECT", "housi-dados").strip()
     or os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
 )
-BQ_DATASET = os.getenv("BQ_DATASET", "OCUPACAO_REFINED_ZONE")
+BQ_DATASET = os.getenv("BQ_DATASET", "INVEST_REFINED_ZONE")
 BQ_TABLE = os.getenv("BQ_TABLE", "laminas_fechamento_invest")
 
 LOAD_MODE = (
